@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-sdk/helper/customdiff"
 	"github.com/hashicorp/terraform-plugin-sdk/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/helper/validation"
@@ -27,7 +28,7 @@ func resourceUCloudEIP() *schema.Resource {
 				Type:         schema.TypeInt,
 				Optional:     true,
 				Computed:     true,
-				ValidateFunc: validation.IntBetween(0, 800),
+				ValidateFunc: validation.IntBetween(1, 800),
 			},
 
 			"internet_type": {
@@ -37,6 +38,7 @@ func resourceUCloudEIP() *schema.Resource {
 				ValidateFunc: validation.StringInSlice([]string{
 					"bgp",
 					"international",
+					"native",
 				}, false),
 			},
 
@@ -66,6 +68,7 @@ func resourceUCloudEIP() *schema.Resource {
 			"share_bandwidth_package_id": {
 				Type:     schema.TypeString,
 				Optional: true,
+				Computed: true,
 			},
 
 			"duration": {
@@ -173,16 +176,43 @@ func resourceUCloudEIPCreate(d *schema.ResourceData, meta interface{}) error {
 		req.ChargeType = ucloud.String("Month")
 	}
 
-	if v, ok := d.GetOk("charge_mode"); ok {
-		req.PayMode = ucloud.String(upperCamelCvt.unconvert(v.(string)))
-	} else {
-		req.PayMode = ucloud.String(upperCamelCvt.unconvert("bandwidth"))
+	chargeMode, hasChargeMode := d.GetOk("charge_mode")
+	shareBandwidthPackageID, hasShareBandwidthPackageID := d.GetOk("share_bandwidth_package_id")
+
+	effectiveChargeMode := "bandwidth"
+	if hasShareBandwidthPackageID {
+		effectiveChargeMode = "share_bandwidth"
+	}
+	if hasChargeMode {
+		effectiveChargeMode = chargeMode.(string)
 	}
 
-	if v, ok := d.GetOk("bandwidth"); ok {
+	if effectiveChargeMode == "share_bandwidth" && !hasShareBandwidthPackageID {
+		return fmt.Errorf("share_bandwidth_package_id must be set when charge_mode is %q", "share_bandwidth")
+	}
+	if effectiveChargeMode != "share_bandwidth" && hasShareBandwidthPackageID {
+		return fmt.Errorf("share_bandwidth_package_id can only be used when charge_mode is %q", "share_bandwidth")
+	}
+
+	req.PayMode = ucloud.String(upperCamelCvt.unconvert(effectiveChargeMode))
+
+	if effectiveChargeMode == "share_bandwidth" {
+		req.ShareBandwidthId = ucloud.String(shareBandwidthPackageID.(string))
+		req.Bandwidth = ucloud.Int(0)
+	} else if v, ok := d.GetOkExists("bandwidth"); ok {
 		req.Bandwidth = ucloud.Int(v.(int))
 	} else {
 		req.Bandwidth = ucloud.Int(1)
+	}
+
+	if effectiveChargeMode == "share_bandwidth" {
+		if v, ok := d.GetOkExists("bandwidth"); ok && v.(int) != 0 {
+			return fmt.Errorf("bandwidth must be 0 when charge_mode is %q", "share_bandwidth")
+		}
+	} else {
+		if v, ok := d.GetOkExists("bandwidth"); ok && v.(int) == 0 {
+			return fmt.Errorf("bandwidth must be greater than 0 unless charge_mode is %q", "share_bandwidth")
+		}
 	}
 
 	if v, ok := d.GetOkExists("duration"); ok {
@@ -246,6 +276,9 @@ func resourceUCloudEIPUpdate(d *schema.ResourceData, meta interface{}) error {
 	}
 
 	if d.HasChange("bandwidth") && !d.IsNewResource() && !d.HasChange("share_bandwidth_package_id") {
+    if d.Get("charge_mode").(string) == "share_bandwidth" {
+			return fmt.Errorf("bandwidth cannot be modified when charge_mode is %q", "share_bandwidth")
+		}
 		reqBand := conn.NewModifyEIPBandwidthRequest()
 		reqBand.EIPId = ucloud.String(d.Id())
 		reqBand.Bandwidth = ucloud.Int(d.Get("bandwidth").(int))
@@ -411,6 +444,11 @@ func resourceUCloudEIPRead(d *schema.ResourceData, meta interface{}) error {
 	d.Set("bandwidth", eip.Bandwidth)
 	d.Set("charge_type", upperCamelCvt.convert(eip.ChargeType))
 	d.Set("charge_mode", upperCamelCvt.convert(eip.PayMode))
+	if eip.PayMode == "ShareBandwidth" {
+		d.Set("share_bandwidth_package_id", eip.ShareBandwidthSet.ShareBandwidthId)
+	} else {
+		d.Set("share_bandwidth_package_id", "")
+	}
 	d.Set("name", eip.Name)
 	d.Set("remark", eip.Remark)
 	d.Set("tag", eip.Tag)
